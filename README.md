@@ -112,10 +112,6 @@ archive_file_index = 0            # Which split file this chunk belongs to (0 is
   * **Proprietary DZ Algorithm**: Does not support the proprietary compression algorithm flagged as `CHUNK_DZ (0x04)` (internal Marmalade format). If encountered during unpacking, the tool will report an error, but raw data will be preserved if possible.
   * **Encryption**: Does not support archives with DRM or custom encryption.
 
-## 👨‍💻 Author
-
-  * **Ed1th**
-
 ## 📄 License
 
 This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
