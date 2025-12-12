@@ -10,7 +10,7 @@ mod utils;
 
 #[derive(Parser)]
 #[command(
-    name = "dzip-cli",
+    name = "dzip_cli",
     author = "Ed1th",
     version,
     about = "Marmalade SDK .dz Archive Tool",
