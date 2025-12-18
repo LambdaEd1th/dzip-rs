@@ -31,7 +31,7 @@ enum Commands {
         /// Output directory (optional)
         #[arg(short, long)]
         outdir: Option<PathBuf>,
-        
+
         /// Keep raw compressed data for unsupported chunks (e.g. CHUNK_DZ)
         #[arg(long)]
         keep_raw: bool,
@@ -50,7 +50,11 @@ fn main() {
     let args = Cli::parse();
 
     let res = match args.command {
-        Commands::Unpack { input, outdir, keep_raw } => unpack::do_unpack(&input, outdir, keep_raw),
+        Commands::Unpack {
+            input,
+            outdir,
+            keep_raw,
+        } => unpack::do_unpack(&input, outdir, keep_raw),
         Commands::Pack { config } => pack::do_pack(&config),
     };
 
