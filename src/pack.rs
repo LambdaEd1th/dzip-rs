@@ -5,27 +5,26 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::Rc; // [Optimization]
 
 use crate::compression::CodecRegistry;
 use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, MAGIC};
+use crate::error::DzipError;
 use crate::types::{ChunkDef, Config};
-use crate::utils::encode_flags;
+use crate::utils::encode_flags; // [Added]
 
 pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
     let toml_content = fs::read_to_string(config_path)?;
     let config: Config = toml::from_str(&toml_content)?;
 
-    // Safe handling of path components
     let base_dir = config_path
         .file_stem()
-        .ok_or_else(|| anyhow!("Invalid config filename: {:?}", config_path))?
+        .ok_or_else(|| anyhow!("Invalid config filename"))?
         .to_string_lossy()
         .to_string();
-
     let base_path = config_path
         .parent()
-        .ok_or_else(|| anyhow!("Cannot determine parent directory of {:?}", config_path))?
+        .ok_or_else(|| anyhow!("Cannot determine parent directory"))?
         .join(&base_dir);
 
     info!("Packing from directory: {:?}", base_path);
@@ -34,9 +33,7 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
     let mut has_dz_chunk = false;
     for c in &config.chunks {
         chunk_map_def.insert(c.id, c);
-
-        let flags_bits = encode_flags(&c.flags);
-        let flags = ChunkFlags::from_bits_truncate(flags_bits);
+        let flags = ChunkFlags::from_bits_truncate(encode_flags(&c.flags));
         if flags.contains(ChunkFlags::DZ_RANGE) {
             has_dz_chunk = true;
         }
@@ -45,6 +42,7 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
     // 1. Index Source Files
     info!("Indexing source files...");
     let mut chunk_source_map: HashMap<u16, (Rc<PathBuf>, u64, usize)> = HashMap::new();
+
     for f_entry in &config.files {
         let mut clean_rel_path = PathBuf::new();
         for part in f_entry.path.split(['/', '\\']) {
@@ -60,25 +58,20 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         let full_path = base_path.join(clean_rel_path);
 
         if !full_path.exists() {
-            return Err(anyhow!("Missing source: {:?}", full_path));
+            // [Error] Specific Config error
+            return Err(
+                DzipError::Config(format!("Source file not found: {:?}", full_path)).into(),
+            );
         }
 
         let full_path_rc = Rc::new(full_path);
-
         let mut current_offset: u64 = 0;
         for cid in &f_entry.chunks {
-            // Safely get chunk definition
             let c_def = chunk_map_def.get(cid).ok_or_else(|| {
-                anyhow!(
-                    "Chunk ID {} referenced in file '{}' but not defined in [chunks]",
-                    cid,
-                    f_entry.path
-                )
+                DzipError::Config(format!("Chunk ID {} undefined in [chunks]", cid))
             })?;
 
-            let flags_bits = encode_flags(&c_def.flags);
-            let flags = ChunkFlags::from_bits_truncate(flags_bits);
-
+            let flags = ChunkFlags::from_bits_truncate(encode_flags(&c_def.flags));
             let read_len = if flags.contains(ChunkFlags::DZ_RANGE) {
                 c_def.size_compressed
             } else {
@@ -106,7 +99,6 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
 
     let mut sorted_dirs: Vec<String> = unique_dirs.into_iter().collect();
     sorted_dirs.sort();
-
     if let Some(pos) = sorted_dirs.iter().position(|x| x == ".") {
         sorted_dirs.remove(pos);
     }
@@ -139,7 +131,6 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         } else {
             &raw_d
         };
-
         let d_id = *dir_map.get(d_key).unwrap_or(&0) as u16;
         header_buffer.write_u16::<LittleEndian>(d_id)?;
         for cid in &f.chunks {
@@ -184,79 +175,62 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         }
     }
 
-    // 3. Write Files
     let out_filename_0 = format!("{}_packed.dz", base_dir);
     let mut current_offset_0 = header_buffer.position() as u32;
-
-    info!("Writing main archive: {}", out_filename_0);
     let f0 = File::create(&out_filename_0)?;
     let mut writer0 = BufWriter::new(f0);
     writer0.write_all(header_buffer.get_ref())?;
 
     let mut split_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
     let mut split_offsets: HashMap<u16, u32> = HashMap::new();
-
     for (i, fname) in config.archive_files.iter().enumerate() {
         let idx = (i + 1) as u16;
         let path = config_path.parent().unwrap().join(fname);
-        info!("Creating split archive: {:?}", path);
         let f = File::create(&path)?;
         split_writers.insert(idx, BufWriter::new(f));
         split_offsets.insert(idx, 0);
     }
 
     // 4. Stream Data
-    info!("Processing chunks (streaming)...");
     let mut sorted_chunks_def = config.chunks.clone();
     sorted_chunks_def.sort_by_key(|c| c.id);
 
     for c_def in &mut sorted_chunks_def {
         let (source_path, src_offset, read_len) = chunk_source_map
             .get(&c_def.id)
-            .ok_or_else(|| anyhow!("Source mapping missing for chunk ID: {}", c_def.id))?;
+            .ok_or_else(|| anyhow!("Source map missing for chunk ID: {}", c_def.id))?;
 
-        // [Fix] Explicitly call .as_path() on the Rc<PathBuf> reference
+        // [Fix] Dereference Rc via as_path()
         let mut f_in = File::open(source_path.as_path())?;
         f_in.seek(SeekFrom::Start(*src_offset))?;
         let mut chunk_reader = f_in.take(*read_len as u64);
 
         let flags_int = encode_flags(&c_def.flags);
-
         let target_writer = if c_def.archive_file_index == 0 {
             &mut writer0
         } else {
             split_writers
                 .get_mut(&c_def.archive_file_index)
                 .ok_or_else(|| {
-                    anyhow!(
-                        "Split archive writer index {} not initialized",
+                    DzipError::Config(format!(
+                        "Split writer {} not initialized",
                         c_def.archive_file_index
-                    )
+                    ))
                 })?
         };
 
         let start_pos = target_writer.stream_position()?;
-
         registry.compress(&mut chunk_reader, target_writer, flags_int)?;
         target_writer.flush()?;
-
         let end_pos = target_writer.stream_position()?;
         let comp_len = (end_pos - start_pos) as u32;
 
         c_def.offset = if c_def.archive_file_index == 0 {
             current_offset_0
         } else {
-            *split_offsets
-                .get(&c_def.archive_file_index)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Split archive offset index {} not found",
-                        c_def.archive_file_index
-                    )
-                })?
+            *split_offsets.get(&c_def.archive_file_index).unwrap()
         };
         c_def.size_compressed = comp_len;
-
         if c_def.archive_file_index == 0 {
             current_offset_0 += comp_len;
         } else {
@@ -269,8 +243,6 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         w.flush()?;
     }
 
-    // 5. Finalize Header
-    info!("Finalizing header...");
     let mut table_writer = Cursor::new(Vec::new());
     for c in &sorted_chunks_def {
         table_writer.write_u32::<LittleEndian>(c.offset)?;

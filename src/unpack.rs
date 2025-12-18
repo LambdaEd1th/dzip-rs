@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 use log::{info, warn};
 use std::collections::{HashMap, hash_map::Entry};
@@ -7,7 +7,8 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 use crate::compression::CodecRegistry;
-use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, MAGIC}; // [Refactor] Import ChunkFlags
+use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, MAGIC};
+use crate::error::DzipError;
 use crate::types::{ArchiveMeta, ChunkDef, Config, FileEntry, RangeSettings};
 use crate::utils::{decode_flags, read_null_term_string, sanitize_path};
 
@@ -17,14 +18,17 @@ pub fn do_unpack(
     keep_raw: bool,
     registry: &CodecRegistry,
 ) -> Result<()> {
-    let main_file_raw = File::open(input_path)?;
+    let main_file_raw = File::open(input_path)
+        .map_err(DzipError::Io)
+        .context(format!("Failed to open main archive: {:?}", input_path))?;
+
     let main_file_len = main_file_raw.metadata()?.len();
     let mut main_file = BufReader::new(main_file_raw);
 
     // 1. Read Header
     let magic = main_file.read_u32::<LittleEndian>()?;
     if magic != MAGIC {
-        return Err(anyhow!("Invalid Magic: expected DTRZ"));
+        return Err(DzipError::InvalidMagic(magic).into());
     }
     let num_files = main_file.read_u16::<LittleEndian>()?;
     let num_dirs = main_file.read_u16::<LittleEndian>()?;
@@ -35,7 +39,6 @@ pub fn do_unpack(
         version, num_files, num_dirs
     );
 
-    // 2. Read Strings
     let mut user_files = Vec::new();
     for _ in 0..num_files {
         user_files.push(read_null_term_string(&mut main_file)?);
@@ -47,7 +50,6 @@ pub fn do_unpack(
         directories.push(read_null_term_string(&mut main_file)?);
     }
 
-    // 3. Mapping Table
     struct FileMapEntry {
         id: usize,
         dir_idx: usize,
@@ -71,7 +73,6 @@ pub fn do_unpack(
         });
     }
 
-    // 4. Chunk Settings
     let num_arch_files = main_file.read_u16::<LittleEndian>()?;
     let num_chunks = main_file.read_u16::<LittleEndian>()?;
     info!(
@@ -79,7 +80,6 @@ pub fn do_unpack(
         num_chunks, num_arch_files
     );
 
-    // 5. Chunk List
     #[derive(Clone)]
     struct RawChunk {
         id: u16,
@@ -100,7 +100,6 @@ pub fn do_unpack(
         let flags_raw = main_file.read_u16::<LittleEndian>()?;
         let file_idx = main_file.read_u16::<LittleEndian>()?;
 
-        // [Refactor] Use bitflags to check DZ_RANGE
         let flags = ChunkFlags::from_bits_truncate(flags_raw);
         if flags.contains(ChunkFlags::DZ_RANGE) {
             has_dz_chunk = true;
@@ -117,7 +116,6 @@ pub fn do_unpack(
         });
     }
 
-    // 6. Split Filenames
     let mut split_file_names = Vec::new();
     if num_arch_files > 1 {
         info!("Reading {} split archive filenames...", num_arch_files - 1);
@@ -126,7 +124,6 @@ pub fn do_unpack(
         }
     }
 
-    // 7. Decoder Settings
     let mut range_settings_opt = None;
     if has_dz_chunk {
         info!("Detected CHUNK_DZ, reading RangeSettings...");
@@ -144,25 +141,30 @@ pub fn do_unpack(
         });
     }
 
-    // --- Prepare (ZSIZE Correction) ---
+    // --- ZSIZE Correction ---
     let base_dir = input_path.parent().unwrap_or(std::path::Path::new("."));
     let mut file_chunks_map: HashMap<u16, Vec<usize>> = HashMap::new();
     for (idx, c) in chunks.iter().enumerate() {
         file_chunks_map.entry(c.file_idx).or_default().push(idx);
     }
-
     for (f_idx, c_indices) in file_chunks_map.iter() {
         let mut sorted_indices = c_indices.clone();
         sorted_indices.sort_by_key(|&i| chunks[i].offset);
-
         let current_file_size = if *f_idx == 0 {
             main_file_len
         } else {
             let split_name = &split_file_names[(*f_idx - 1) as usize];
             let split_path = base_dir.join(split_name);
-            fs::metadata(&split_path)?.len()
+            fs::metadata(&split_path)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        DzipError::SplitFileMissing(split_path.clone())
+                    } else {
+                        DzipError::Io(e)
+                    }
+                })?
+                .len()
         };
-
         for k in 0..sorted_indices.len() {
             let idx = sorted_indices[k];
             let current_offset = chunks[idx].offset;
@@ -179,21 +181,17 @@ pub fn do_unpack(
         }
     }
 
-    // [Optimization] Map ChunkID -> Vector Index
-    // Instead of cloning the entire RawChunk struct into a HashMap, we store indices.
-    // This reduces memory usage and avoids unnecessary cloning.
     let chunk_indices: HashMap<u16, usize> =
         chunks.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
+    // [Fix] Here is where the error was. Now `anyhow!` macro is available.
     let base_name = input_path
         .file_stem()
-        .ok_or_else(|| anyhow!("Invalid input file path (no stem): {:?}", input_path))?
+        .ok_or_else(|| anyhow!("Invalid input file path"))?
         .to_string_lossy();
-
     let root_out = out_opt.unwrap_or_else(|| PathBuf::from(&base_name.to_string()));
     fs::create_dir_all(&root_out)?;
 
-    // 8. Extraction
     info!(
         "Extracting {} files to {:?}...",
         map_entries.len(),
@@ -209,31 +207,23 @@ pub fn do_unpack(
         } else {
             "."
         };
-
         let full_raw_path = if raw_dir == "." || raw_dir.is_empty() {
             fname.clone()
         } else {
             format!("{}/{}", raw_dir, fname)
         };
 
-        // [Fix] sanitize_path (in utils.rs) now handles separator normalization.
-        // It ensures the path is created correctly on disk regardless of input separator style.
         let disk_path = sanitize_path(&root_out, &full_raw_path)?;
-
-        // [Fix] Use MAIN_SEPARATOR_STR for display strings (TOML/Logs)
-        // This ensures generated config files use '\' on Windows and '/' on Unix.
         let rel_path_display = full_raw_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
         let dir_display = raw_dir.replace(['/', '\\'], MAIN_SEPARATOR_STR);
 
         if let Some(parent) = disk_path.parent() {
             fs::create_dir_all(parent)?;
         }
-
         let out_file = File::create(&disk_path)?;
         let mut writer = BufWriter::new(out_file);
 
         for cid in &entry.chunk_ids {
-            // [Optimization] Use index lookup to borrow the chunk
             if let Some(&idx) = chunk_indices.get(cid) {
                 let chunk = &chunks[idx];
 
@@ -251,8 +241,13 @@ pub fn do_unpack(
                         Entry::Vacant(e) => {
                             let f_name = &split_file_names[(chunk.file_idx - 1) as usize];
                             let f_path = base_dir.join(f_name);
-                            let f = File::open(&f_path)
-                                .map_err(|e| anyhow!("Missing split file {:?}: {}", f_path, e))?;
+                            let f = File::open(&f_path).map_err(|e| {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    DzipError::SplitFileMissing(f_path.clone())
+                                } else {
+                                    DzipError::Io(e)
+                                }
+                            })?;
                             let mut f_clone = f.try_clone()?;
                             f_clone.seek(SeekFrom::Start(chunk.offset as u64))?;
                             e.insert(f);
@@ -265,8 +260,6 @@ pub fn do_unpack(
                     registry.decompress(&mut source_reader, &mut writer, chunk.flags, chunk.d_len)
                 {
                     drop(source_reader);
-
-                    // [Refactor] Use bitflags checks
                     let c_flags = ChunkFlags::from_bits_truncate(chunk.flags);
 
                     if c_flags.contains(ChunkFlags::DZ_RANGE) && keep_raw {
@@ -278,22 +271,18 @@ pub fn do_unpack(
                             main_file.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(main_file.by_ref().take(chunk.real_c_len as u64))
                         } else {
-                            let f = split_handles.get(&chunk.file_idx).ok_or_else(|| {
-                                anyhow!(
-                                    "Split file handle for index {} not found/opened",
-                                    chunk.file_idx
-                                )
-                            })?;
+                            let f = split_handles.get(&chunk.file_idx).unwrap();
                             let mut f_clone = f.try_clone()?;
                             f_clone.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(f_clone.take(chunk.real_c_len as u64))
                         };
                         std::io::copy(&mut raw_reader, &mut writer)?;
                     } else if c_flags.contains(ChunkFlags::DZ_RANGE) {
-                        return Err(anyhow!(
-                            "Unsupported chunk format (DZ_RANGE) in {}. Use --keep-raw.",
+                        return Err(DzipError::Unsupported(format!(
+                            "Chunk format DZ_RANGE in {}. Use --keep-raw.",
                             rel_path_display
-                        ));
+                        ))
+                        .into());
                     } else {
                         warn!(
                             "Failed to decompress {}: {}. Writing raw data.",
@@ -303,12 +292,7 @@ pub fn do_unpack(
                             main_file.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(main_file.by_ref().take(chunk.real_c_len as u64))
                         } else {
-                            let f = split_handles.get(&chunk.file_idx).ok_or_else(|| {
-                                anyhow!(
-                                    "Split file handle for index {} not found/opened",
-                                    chunk.file_idx
-                                )
-                            })?;
+                            let f = split_handles.get(&chunk.file_idx).unwrap();
                             let mut f_clone = f.try_clone()?;
                             f_clone.seek(SeekFrom::Start(chunk.offset as u64))?;
                             Box::new(f_clone.take(chunk.real_c_len as u64))
@@ -319,7 +303,6 @@ pub fn do_unpack(
             }
         }
         writer.flush()?;
-
         toml_files.push(FileEntry {
             path: rel_path_display,
             directory: dir_display,
