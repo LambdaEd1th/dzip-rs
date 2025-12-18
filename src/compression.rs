@@ -8,7 +8,7 @@ pub fn decompress_chunk(data: &[u8], flags: u16, expected_len: u32) -> Result<Ve
     }
 
     if flags & CHUNK_DZ != 0 {
-         return Ok(data.to_vec());
+        return Ok(data.to_vec());
     }
 
     if flags & CHUNK_LZMA != 0 {
