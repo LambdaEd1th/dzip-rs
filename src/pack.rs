@@ -7,7 +7,8 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 use crate::compression::CodecRegistry;
 use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, DEFAULT_BUFFER_SIZE, MAGIC};
@@ -46,7 +47,6 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
 
     // 1. Index Source Files
     info!("Indexing source files...");
-    // [Modified] Use Arc<PathBuf> for thread safety in parallel processing
     let mut chunk_source_map: HashMap<u16, (Arc<PathBuf>, u64, usize)> = HashMap::new();
 
     for f_entry in &config.files {
@@ -186,7 +186,6 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
     let mut split_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
     let mut split_offsets: HashMap<u16, u32> = HashMap::new();
 
-    // [Safety] Replace unwrap() with ok_or_else to prevent panic
     let config_parent = config_path
         .parent()
         .ok_or_else(|| anyhow!("Config path has no parent"))?;
@@ -200,12 +199,12 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         split_offsets.insert(idx, 0);
     }
 
-    // 4. Stream Data (Parallelized & Buffered)
+    // 4. Stream Data (Pipeline: Producer -> Channel -> Writer Thread)
     let mut sorted_chunks_def = config.chunks.clone();
     sorted_chunks_def.sort_by_key(|c| c.id);
 
     info!(
-        "Compressing {} chunks (Parallel)...",
+        "Compressing {} chunks (Pipeline)...",
         sorted_chunks_def.len()
     );
 
@@ -217,31 +216,124 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
         flags: Vec<std::borrow::Cow<'static, str>>,
     }
 
-    let jobs: Vec<CompressionJob> = sorted_chunks_def
+    // [Optimization]: Handled potential error map lookup safely using Result
+    let jobs: Result<Vec<CompressionJob>> = sorted_chunks_def
         .iter()
         .enumerate()
         .map(|(i, c_def)| {
             let (source_path, src_offset, read_len) = chunk_source_map
                 .get(&c_def.id)
-                .expect("Source map missing for chunk");
+                .ok_or_else(|| anyhow!("Source map missing for chunk ID {}", c_def.id))?;
 
-            CompressionJob {
+            Ok(CompressionJob {
                 chunk_idx: i,
                 source_path: source_path.clone(),
                 offset: *src_offset,
                 read_len: *read_len,
                 flags: c_def.flags.clone(),
-            }
+            })
         })
         .collect();
 
-    let compressed_results: Result<Vec<_>> = jobs
-        .par_iter()
-        .map(|job| -> Result<(usize, Vec<u8>)> {
+    let jobs = jobs?; // Propagate error if chunk map was inconsistent
+
+    let channel_bound = rayon::current_num_threads() * 4;
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(channel_bound);
+
+    // Spawn Writer Thread
+    let writer_handle = thread::spawn(move || -> Result<(Vec<ChunkDef>, BufWriter<File>)> {
+        let total_chunks = sorted_chunks_def.len();
+        let mut buffer: HashMap<usize, Vec<u8>> = HashMap::new();
+        let mut next_idx = 0;
+
+        while next_idx < total_chunks {
+            // Check if next chunk is already buffered
+            let data = if let Some(d) = buffer.remove(&next_idx) {
+                d
+            } else {
+                // Not buffered, wait for it
+                match rx.recv() {
+                    Ok((idx, res)) => {
+                        let chunk_data = res?;
+                        if idx == next_idx {
+                            chunk_data
+                        } else {
+                            // Out of order arrival, buffer it
+                            buffer.insert(idx, chunk_data);
+                            continue;
+                        }
+                    }
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "Compression threads disconnected before finishing all chunks"
+                        ));
+                    }
+                }
+            };
+
+            // Write Logic
+            let c_def = &mut sorted_chunks_def[next_idx];
+            let target_writer = if c_def.archive_file_index == 0 {
+                &mut writer0
+            } else {
+                split_writers
+                    .get_mut(&c_def.archive_file_index)
+                    .ok_or_else(|| {
+                        DzipError::Config(format!(
+                            "Chunk {} refers to non-existent archive_file_index: {}",
+                            c_def.id, c_def.archive_file_index
+                        ))
+                    })?
+            };
+
+            let current_pos = if c_def.archive_file_index == 0 {
+                current_offset_0
+            } else {
+                *split_offsets
+                    .get(&c_def.archive_file_index)
+                    .ok_or_else(|| {
+                        DzipError::Config(format!(
+                            "Missing offset tracking for archive_file_index: {}",
+                            c_def.archive_file_index
+                        ))
+                    })?
+            };
+
+            target_writer.write_all(&data)?;
+
+            c_def.offset = current_pos;
+            c_def.size_compressed = data.len() as u32;
+
+            if c_def.archive_file_index == 0 {
+                current_offset_0 += c_def.size_compressed;
+            } else {
+                let offset_ref = split_offsets
+                    .get_mut(&c_def.archive_file_index)
+                    .ok_or_else(|| {
+                        DzipError::Config(format!(
+                            "Missing offset tracking for archive_file_index: {}",
+                            c_def.archive_file_index
+                        ))
+                    })?;
+                *offset_ref += c_def.size_compressed;
+            }
+
+            next_idx += 1;
+        }
+
+        for w in split_writers.values_mut() {
+            w.flush()?;
+        }
+
+        Ok((sorted_chunks_def, writer0))
+    });
+
+    // Run Compression Jobs (Producers)
+    jobs.par_iter().for_each_with(tx, |s, job| {
+        let res = (|| -> Result<Vec<u8>> {
             let mut f_in = File::open(job.source_path.as_ref())?;
             f_in.seek(SeekFrom::Start(job.offset))?;
 
-            // [Critical Optimization] Add BufReader to avoid syscall overhead on small reads
             let buffered_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, f_in);
             let mut chunk_reader = buffered_reader.take(job.read_len as u64);
 
@@ -249,70 +341,18 @@ pub fn do_pack(config_path: &PathBuf, registry: &CodecRegistry) -> Result<()> {
             let flags_int = encode_flags(&job.flags);
 
             registry.compress(&mut chunk_reader, &mut compressed_buffer, flags_int)?;
-            Ok((job.chunk_idx, compressed_buffer))
-        })
-        .collect();
+            Ok(compressed_buffer)
+        })();
 
-    let compressed_chunks = compressed_results?;
+        let _ = s.send((job.chunk_idx, res));
+    });
 
-    // [Sequential Write] - Eliminate Panics here
-    for (idx, data) in compressed_chunks {
-        let c_def = &mut sorted_chunks_def[idx];
-
-        let target_writer = if c_def.archive_file_index == 0 {
-            &mut writer0
-        } else {
-            // [Safety] Replace unwrap() with a descriptive error
-            split_writers
-                .get_mut(&c_def.archive_file_index)
-                .ok_or_else(|| {
-                    DzipError::Config(format!(
-                        "Chunk {} refers to non-existent archive_file_index: {}",
-                        c_def.id, c_def.archive_file_index
-                    ))
-                })?
-        };
-
-        let current_pos = if c_def.archive_file_index == 0 {
-            current_offset_0
-        } else {
-            *split_offsets
-                .get(&c_def.archive_file_index)
-                .ok_or_else(|| {
-                    DzipError::Config(format!(
-                        "Missing offset tracking for archive_file_index: {}",
-                        c_def.archive_file_index
-                    ))
-                })?
-        };
-
-        target_writer.write_all(&data)?;
-
-        c_def.offset = current_pos;
-        c_def.size_compressed = data.len() as u32;
-
-        if c_def.archive_file_index == 0 {
-            current_offset_0 += c_def.size_compressed;
-        } else {
-            let offset_ref = split_offsets
-                .get_mut(&c_def.archive_file_index)
-                .ok_or_else(|| {
-                    DzipError::Config(format!(
-                        "Missing offset tracking for archive_file_index: {}",
-                        c_def.archive_file_index
-                    ))
-                })?;
-            *offset_ref += c_def.size_compressed;
-        }
-    }
-
-    writer0.flush()?;
-    for w in split_writers.values_mut() {
-        w.flush()?;
-    }
+    let (final_chunks_def, mut writer0) = writer_handle
+        .join()
+        .map_err(|e| anyhow!("Writer thread panicked: {:?}", e))??;
 
     let mut table_writer = Cursor::new(Vec::new());
-    for c in &sorted_chunks_def {
+    for c in &final_chunks_def {
         table_writer.write_u32::<LittleEndian>(c.offset)?;
         table_writer.write_u32::<LittleEndian>(c.size_compressed)?;
         table_writer.write_u32::<LittleEndian>(c.size_decompressed)?;

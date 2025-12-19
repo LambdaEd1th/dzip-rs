@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{MAIN_SEPARATOR_STR, PathBuf}; // [Added] Rayon for parallelism
+use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 
 use crate::compression::CodecRegistry;
 use crate::constants::{CHUNK_LIST_TERMINATOR, ChunkFlags, DEFAULT_BUFFER_SIZE, MAGIC};
@@ -164,7 +164,10 @@ pub fn do_unpack(
         let current_file_size = if *f_idx == 0 {
             main_file_len
         } else {
-            let split_name = &split_file_names[(*f_idx - 1) as usize];
+            let idx = (*f_idx - 1) as usize;
+            let split_name = split_file_names
+                .get(idx)
+                .ok_or_else(|| anyhow!("Invalid split file index {} in header", f_idx))?;
             let split_path = base_dir.join(split_name);
             fs::metadata(&split_path)
                 .map_err(|e| {
@@ -204,96 +207,118 @@ pub fn do_unpack(
     let root_out = out_opt.unwrap_or_else(|| PathBuf::from(&base_name.to_string()));
     fs::create_dir_all(&root_out)?;
 
-    // 8. Start Extraction (Parallel & Buffered)
+    // 8. Start Extraction (Parallel & Buffered, with Thread-Local File Cache)
     info!(
         "Extracting {} files to {:?} (Parallel, Buffered)...",
         map_entries.len(),
         root_out
     );
 
-    map_entries.par_iter().try_for_each(|entry| -> Result<()> {
-        let fname = &user_files[entry.id];
-        let raw_dir = if entry.dir_idx < directories.len() {
-            &directories[entry.dir_idx]
-        } else {
-            "."
-        };
-        let full_raw_path = if raw_dir == "." || raw_dir.is_empty() {
-            fname.clone()
-        } else {
-            format!("{}/{}", raw_dir, fname)
-        };
+    map_entries.par_iter().try_for_each_init(
+        HashMap::new, // [Fix]: Use function pointer instead of redundant closure
+        |file_cache, entry| -> Result<()> {
+            let fname = &user_files[entry.id];
+            let raw_dir = if entry.dir_idx < directories.len() {
+                &directories[entry.dir_idx]
+            } else {
+                "."
+            };
+            let full_raw_path = if raw_dir == "." || raw_dir.is_empty() {
+                fname.clone()
+            } else {
+                format!("{}/{}", raw_dir, fname)
+            };
 
-        let disk_path = sanitize_path(&root_out, &full_raw_path)?;
-        let rel_path_display = full_raw_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
+            let disk_path = sanitize_path(&root_out, &full_raw_path)?;
+            let rel_path_display = full_raw_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
 
-        if let Some(parent) = disk_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let out_file = File::create(&disk_path)?;
-        // [Optimization] Buffered Write with large capacity
-        let mut writer = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, out_file);
+            if let Some(parent) = disk_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let out_file = File::create(&disk_path)?;
+            let mut writer = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, out_file);
 
-        for cid in &entry.chunk_ids {
-            if let Some(&idx) = chunk_indices.get(cid) {
-                let chunk = &chunks[idx];
+            for cid in &entry.chunk_ids {
+                if let Some(&idx) = chunk_indices.get(cid) {
+                    let chunk = &chunks[idx];
 
-                // [Optimization] Buffered Read & Open new file handle per thread
-                let mut source_file = if chunk.file_idx == 0 {
-                    File::open(input_path)?
-                } else {
-                    let split_name = &split_file_names[(chunk.file_idx - 1) as usize];
-                    let split_path = base_dir.join(split_name);
-                    File::open(&split_path).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            DzipError::SplitFileMissing(split_path.clone())
-                        } else {
-                            DzipError::Io(e)
+                    // --- [Optimized] Thread-Local File Caching with Safety Checks ---
+                    // [Fix]: Use entry API to avoid double lookup and Clippy warning
+                    let source_file = match file_cache.entry(chunk.file_idx) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let f = if chunk.file_idx == 0 {
+                                File::open(input_path).map_err(DzipError::Io)?
+                            } else {
+                                // [Safety]: Check array bounds for split files to avoid panic
+                                let split_idx = (chunk.file_idx - 1) as usize;
+                                let split_name =
+                                    split_file_names.get(split_idx).ok_or_else(|| {
+                                        anyhow!(
+                                            "Invalid archive file index {} for chunk {}",
+                                            chunk.file_idx,
+                                            chunk.id
+                                        )
+                                    })?;
+
+                                let split_path = base_dir.join(split_name);
+                                File::open(&split_path).map_err(|e| {
+                                    if e.kind() == std::io::ErrorKind::NotFound {
+                                        DzipError::SplitFileMissing(split_path.clone())
+                                    } else {
+                                        DzipError::Io(e)
+                                    }
+                                })?
+                            };
+                            e.insert(f)
                         }
-                    })?
-                };
+                    };
 
-                source_file.seek(SeekFrom::Start(chunk.offset as u64))?;
-                // Wrap in BufReader for performance
-                let buffered_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, source_file);
-                let mut source_reader = buffered_reader.take(chunk.real_c_len as u64);
+                    source_file.seek(SeekFrom::Start(chunk.offset as u64))?;
 
-                if let Err(e) =
-                    registry.decompress(&mut source_reader, &mut writer, chunk.flags, chunk.d_len)
-                {
-                    // Fallback: copy raw
-                    // Unwraps BufReader to get the underlying file handle for seeking
-                    let mut raw_reader = source_reader.into_inner();
-                    raw_reader.seek(SeekFrom::Start(chunk.offset as u64))?;
-                    let mut raw_take = raw_reader.take(chunk.real_c_len as u64);
+                    let buffered_reader =
+                        BufReader::with_capacity(DEFAULT_BUFFER_SIZE, source_file);
+                    let mut source_reader = buffered_reader.take(chunk.real_c_len as u64);
 
-                    let c_flags = ChunkFlags::from_bits_truncate(chunk.flags);
+                    if let Err(e) = registry.decompress(
+                        &mut source_reader,
+                        &mut writer,
+                        chunk.flags,
+                        chunk.d_len,
+                    ) {
+                        // Fallback: copy raw
+                        let mut raw_buf_reader = source_reader.into_inner();
+                        raw_buf_reader.seek(SeekFrom::Start(chunk.offset as u64))?;
+                        let mut raw_take = raw_buf_reader.take(chunk.real_c_len as u64);
 
-                    if c_flags.contains(ChunkFlags::DZ_RANGE) && keep_raw {
-                        info!(
-                            "Keeping raw data for chunk {} (DZ_RANGE) in {}",
-                            chunk.id, rel_path_display
-                        );
-                        std::io::copy(&mut raw_take, &mut writer)?;
-                    } else if c_flags.contains(ChunkFlags::DZ_RANGE) {
-                        return Err(DzipError::Unsupported(format!(
-                            "Chunk format DZ_RANGE in {}. Use --keep-raw.",
-                            rel_path_display
-                        ))
-                        .into());
-                    } else {
-                        warn!(
-                            "Failed to decompress {}: {}. Writing raw data.",
-                            rel_path_display, e
-                        );
-                        std::io::copy(&mut raw_take, &mut writer)?;
+                        let c_flags = ChunkFlags::from_bits_truncate(chunk.flags);
+
+                        if c_flags.contains(ChunkFlags::DZ_RANGE) && keep_raw {
+                            info!(
+                                "Keeping raw data for chunk {} (DZ_RANGE) in {}",
+                                chunk.id, rel_path_display
+                            );
+                            std::io::copy(&mut raw_take, &mut writer)?;
+                        } else if c_flags.contains(ChunkFlags::DZ_RANGE) {
+                            return Err(DzipError::Unsupported(format!(
+                                "Chunk format DZ_RANGE in {}. Use --keep-raw.",
+                                rel_path_display
+                            ))
+                            .into());
+                        } else {
+                            warn!(
+                                "Failed to decompress {}: {}. Writing raw data.",
+                                rel_path_display, e
+                            );
+                            std::io::copy(&mut raw_take, &mut writer)?;
+                        }
                     }
                 }
             }
-        }
-        writer.flush()?;
-        Ok(())
-    })?;
+            writer.flush()?;
+            Ok(())
+        },
+    )?;
 
     // 9. Generate TOML Info (Sequential)
     let mut toml_files = Vec::new();
@@ -343,7 +368,7 @@ pub fn do_unpack(
             total_directories: num_dirs,
             total_chunks: num_chunks,
         },
-        archive_files: split_file_names,
+        archive_files: split_file_names.clone(),
         range_settings: range_settings_opt,
         files: toml_files,
         chunks: toml_chunks,

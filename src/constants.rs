@@ -5,7 +5,20 @@ pub const CHUNK_LIST_TERMINATOR: u16 = 0xFFFF;
 
 pub const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
 
-// [Refactor] Use bitflags! macro for type-safe flag handling
+// This acts as the Single Source of Truth for flag handling.
+pub const FLAG_MAPPINGS: &[(ChunkFlags, &str)] = &[
+    (ChunkFlags::COMBUF, "COMBUF"),
+    (ChunkFlags::DZ_RANGE, "DZ_RANGE"),
+    (ChunkFlags::ZLIB, "ZLIB"),
+    (ChunkFlags::BZIP, "BZIP"),
+    (ChunkFlags::MP3, "MP3"),
+    (ChunkFlags::JPEG, "JPEG"),
+    (ChunkFlags::ZERO, "ZERO"),
+    (ChunkFlags::COPYCOMP, "COPY"), // Maps COPYCOMP bit to "COPY" string
+    (ChunkFlags::LZMA, "LZMA"),
+    (ChunkFlags::RANDOMACCESS, "RANDOM_ACCESS"),
+];
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ChunkFlags: u16 {
