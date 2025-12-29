@@ -1,4 +1,4 @@
-use crate::constants::{ChunkFlags, DEFAULT_BUFFER_SIZE};
+use crate::constants::ChunkFlags; // [Fixed]: Removed unused DEFAULT_BUFFER_SIZE
 use crate::error::DzipError;
 use anyhow::{Context, Result};
 use std::io::{self, Read, Write};
@@ -61,6 +61,7 @@ impl CodecRegistry {
                 return decoder.decompress(input, output, len);
             }
         }
+        // Fallback: copy directly (e.g. for COPY or unknown flags processed as raw)
         io::copy(input, output)?;
         Ok(())
     }
@@ -77,6 +78,7 @@ impl CodecRegistry {
                 return encoder.compress(input, output);
             }
         }
+        // Fallback: copy directly
         io::copy(input, output)?;
         Ok(())
     }
@@ -87,15 +89,9 @@ impl CodecRegistry {
 struct ZeroDecompressor;
 impl Decompressor for ZeroDecompressor {
     fn decompress(&self, _input: &mut dyn Read, output: &mut dyn Write, len: u32) -> Result<()> {
-        // [Modified] Use global DEFAULT_BUFFER_SIZE instead of hardcoded 4096
-        let chunk_size = DEFAULT_BUFFER_SIZE;
-        let zeros = vec![0u8; chunk_size];
-        let mut remaining = len as usize;
-        while remaining > 0 {
-            let to_write = std::cmp::min(remaining, chunk_size);
-            output.write_all(&zeros[..to_write])?;
-            remaining -= to_write;
-        }
+        // [Optimization] Use std::io::repeat to avoid allocating a large vector of zeros.
+        let mut zero_reader = std::io::repeat(0).take(len as u64);
+        io::copy(&mut zero_reader, output)?;
         Ok(())
     }
 }
@@ -134,10 +130,13 @@ impl Decompressor for Bzip2Decompressor {
 struct PassThroughDecompressor;
 impl Decompressor for PassThroughDecompressor {
     fn decompress(&self, input: &mut dyn Read, output: &mut dyn Write, _len: u32) -> Result<()> {
+        // Direct copy for DZ_RANGE or COPY
         io::copy(input, output)?;
         Ok(())
     }
 }
+
+// --- Compressors ---
 
 struct LzmaCompressor;
 impl Compressor for LzmaCompressor {
@@ -171,6 +170,15 @@ impl Compressor for Bzip2Compressor {
     }
 }
 
+// [New] PassThroughCompressor for raw copying (DZ_RANGE)
+struct PassThroughCompressor;
+impl Compressor for PassThroughCompressor {
+    fn compress(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
+        io::copy(input, output)?;
+        Ok(())
+    }
+}
+
 pub fn create_default_registry() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
     reg.register_decompressor(ChunkFlags::ZERO, ZeroDecompressor);
@@ -182,5 +190,7 @@ pub fn create_default_registry() -> CodecRegistry {
     reg.register_compressor(ChunkFlags::LZMA, LzmaCompressor);
     reg.register_compressor(ChunkFlags::ZLIB, ZlibCompressor);
     reg.register_compressor(ChunkFlags::BZIP, Bzip2Compressor);
+    // Register PassThroughCompressor for DZ_RANGE (Proprietary format)
+    reg.register_compressor(ChunkFlags::DZ_RANGE, PassThroughCompressor);
     reg
 }

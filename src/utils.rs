@@ -98,3 +98,44 @@ pub fn sanitize_path(base: &Path, rel_path_str: &str) -> Result<PathBuf> {
 
     Ok(base.join(safe_path))
 }
+
+/// Normalize path: resolve `.` and `..`, but do not access the file system.
+/// This is very useful for handling relative paths in user configuration during the Pack phase.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(..) => {
+                // Keep or ignore depending on the situation; generally relative paths should not contain prefixes
+            }
+            Component::RootDir => {
+                result.push(component.as_os_str());
+            }
+            Component::CurDir => {
+                // Ignore "."
+            }
+            Component::ParentDir => {
+                // Go back one level when encountering ".."
+                result.pop();
+            }
+            Component::Normal(c) => {
+                result.push(c);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_path() {
+        let p = Path::new("foo/bar/../baz");
+        assert_eq!(normalize_path(p), PathBuf::from("foo/baz"));
+
+        let p = Path::new("./foo/./bar");
+        assert_eq!(normalize_path(p), PathBuf::from("foo/bar"));
+    }
+}
