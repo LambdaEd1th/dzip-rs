@@ -109,9 +109,9 @@ impl ArchiveMetadata {
     ) -> Result<Self> {
         let main_file_raw = fs_impl.open_read(input_path)?;
         let main_file_len = fs_impl.file_len(input_path)?;
-        
+
         let mut reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, main_file_raw);
-    
+
         let magic = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
         if magic != MAGIC {
             return Err(DzipError::InvalidMagic(magic));
@@ -119,23 +119,23 @@ impl ArchiveMetadata {
         let num_files = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         let num_dirs = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         let version = reader.read_u8().map_err(DzipError::Io)?;
-    
+
         observer.info(&format!(
             "Header: Ver {}, Files {}, Dirs {}",
             version, num_files, num_dirs
         ));
-    
+
         let mut user_files = Vec::with_capacity(num_files as usize);
         for _ in 0..num_files {
             user_files.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
         }
-    
+
         let mut directories = Vec::with_capacity(num_dirs as usize);
         directories.push(CURRENT_DIR_STR.to_string());
         for _ in 0..(num_dirs - 1) {
             directories.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
         }
-    
+
         let mut map_entries = Vec::with_capacity(num_files as usize);
         for i in 0..num_files {
             let dir_id = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)? as usize;
@@ -153,29 +153,29 @@ impl ArchiveMetadata {
                 chunk_ids,
             });
         }
-    
+
         let num_arch_files = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         let num_chunks = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
         observer.info(&format!(
             "Chunk Settings: {} chunks in {} archive files",
             num_chunks, num_arch_files
         ));
-    
+
         let mut raw_chunks = Vec::with_capacity(num_chunks as usize);
         let mut has_dz_chunk = false;
-    
+
         for i in 0..num_chunks {
             let offset = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let c_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let d_len = reader.read_u32::<LittleEndian>().map_err(DzipError::Io)?;
             let flags_raw = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
             let file_idx = reader.read_u16::<LittleEndian>().map_err(DzipError::Io)?;
-    
+
             let flags = ChunkFlags::from_bits_truncate(flags_raw);
             if flags.contains(ChunkFlags::DZ_RANGE) {
                 has_dz_chunk = true;
             }
-    
+
             raw_chunks.push(RawChunk {
                 id: i,
                 offset,
@@ -186,7 +186,7 @@ impl ArchiveMetadata {
                 real_c_len: 0, // Initially 0, to be corrected in Plan
             });
         }
-    
+
         let mut split_file_names = Vec::new();
         if num_arch_files > 1 {
             observer.info(&format!(
@@ -197,7 +197,7 @@ impl ArchiveMetadata {
                 split_file_names.push(read_null_term_string(&mut reader).map_err(DzipError::Io)?);
             }
         }
-    
+
         let mut range_settings = None;
         if has_dz_chunk {
             observer.info("Detected CHUNK_DZ, reading RangeSettings...");
@@ -214,7 +214,7 @@ impl ArchiveMetadata {
                 big_min_match: reader.read_u8().map_err(DzipError::Io)?,
             });
         }
-    
+
         Ok(Self {
             version,
             input_path: input_path.to_path_buf(),
@@ -242,13 +242,19 @@ impl UnpackPlan {
     }
 
     /// Pure logic to calculate corrected sizes. Does NOT mutate metadata.
-    fn calculate_chunk_sizes(meta: &ArchiveMetadata, fs_impl: &dyn DzipFileSystem) -> Result<Vec<RawChunk>> {
-        let base_dir = meta.input_path.parent().unwrap_or(Path::new(CURRENT_DIR_STR));
-        
+    fn calculate_chunk_sizes(
+        meta: &ArchiveMetadata,
+        fs_impl: &dyn DzipFileSystem,
+    ) -> Result<Vec<RawChunk>> {
+        let base_dir = meta
+            .input_path
+            .parent()
+            .unwrap_or(Path::new(CURRENT_DIR_STR));
+
         // We clone the raw chunks to create a working set for correction.
         // This preserves the original 'raw_chunks' in metadata if we ever need to inspect them.
         let mut chunks = meta.raw_chunks.clone();
-        
+
         let mut file_chunks_map: HashMap<u16, Vec<usize>> = HashMap::new();
         for (idx, c) in chunks.iter().enumerate() {
             file_chunks_map.entry(c.file_idx).or_default().push(idx);
@@ -267,7 +273,7 @@ impl UnpackPlan {
                     DzipError::Generic(format!("Invalid split file index {} in header", f_idx))
                 })?;
                 let split_path = base_dir.join(split_name);
-                
+
                 match fs_impl.file_len(&split_path) {
                     Ok(len) => len,
                     Err(_) => return Err(DzipError::SplitFileMissing(split_path)),
@@ -307,9 +313,13 @@ impl UnpackPlan {
             self.metadata.map_entries.len(),
             root_out
         ));
-    
-        let base_dir = self.metadata.input_path.parent().unwrap_or(Path::new(CURRENT_DIR_STR));
-    
+
+        let base_dir = self
+            .metadata
+            .input_path
+            .parent()
+            .unwrap_or(Path::new(CURRENT_DIR_STR));
+
         // Use processed_chunks for lookup
         let chunk_indices: HashMap<u16, usize> = self
             .processed_chunks
@@ -317,11 +327,11 @@ impl UnpackPlan {
             .enumerate()
             .map(|(i, c)| (c.id, i))
             .collect();
-    
+
         observer.progress_start(self.metadata.map_entries.len() as u64);
-    
+
         self.metadata.map_entries.par_iter().try_for_each_init(
-            HashMap::new, 
+            HashMap::new,
             |file_cache: &mut HashMap<u16, Box<dyn crate::io::ReadSeekSend>>, entry| -> Result<()> {
                 let fname = &self.metadata.user_files[entry.id];
                 let raw_dir = if entry.dir_idx < self.metadata.directories.len() {
@@ -334,21 +344,21 @@ impl UnpackPlan {
                 } else {
                     format!("{}/{}", raw_dir, fname)
                 };
-    
+
                 let disk_path = sanitize_path(root_out, &full_raw_path)?;
-    
+
                 if let Some(parent) = disk_path.parent() {
                     fs_impl.create_dir_all(parent)?;
                 }
-                
+
                 let out_file = fs_impl.create_file(&disk_path)?;
                 let mut writer = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, out_file);
-    
+
                 for cid in &entry.chunk_ids {
                     if let Some(&idx) = chunk_indices.get(cid) {
                         // Use processed_chunks (corrected sizes)
                         let chunk = &self.processed_chunks[idx];
-    
+
                         let source_file = match file_cache.entry(chunk.file_idx) {
                             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                             std::collections::hash_map::Entry::Vacant(e) => {
@@ -356,15 +366,18 @@ impl UnpackPlan {
                                     fs_impl.open_read(&self.metadata.input_path)?
                                 } else {
                                     let split_idx = (chunk.file_idx - 1) as usize;
-                                    let split_name =
-                                        self.metadata.split_file_names.get(split_idx).ok_or_else(|| {
+                                    let split_name = self
+                                        .metadata
+                                        .split_file_names
+                                        .get(split_idx)
+                                        .ok_or_else(|| {
                                             DzipError::Generic(format!(
                                                 "Invalid archive file index {} for chunk {}",
                                                 chunk.file_idx, chunk.id
                                             ))
                                         })?;
                                     let split_path = base_dir.join(split_name);
-                                    
+
                                     match fs_impl.open_read(&split_path) {
                                         Ok(f) => f,
                                         Err(_) => return Err(DzipError::SplitFileMissing(split_path)),
@@ -373,13 +386,15 @@ impl UnpackPlan {
                                 e.insert(f)
                             }
                         };
-    
-                        source_file.seek(SeekFrom::Start(chunk.offset as u64)).map_err(DzipError::Io)?;
-    
+
+                        source_file
+                            .seek(SeekFrom::Start(chunk.offset as u64))
+                            .map_err(DzipError::Io)?;
+
                         let mut source_reader =
                             BufReader::with_capacity(DEFAULT_BUFFER_SIZE, source_file)
                                 .take(chunk.real_c_len as u64);
-    
+
                         if let Err(e) = registry.decompress(
                             &mut source_reader,
                             &mut writer,
@@ -388,18 +403,20 @@ impl UnpackPlan {
                         ) {
                             if keep_raw {
                                 let err_msg = e.to_string();
-    
+
                                 let mut raw_buf_reader = source_reader.into_inner();
-                                raw_buf_reader.seek(SeekFrom::Start(chunk.offset as u64)).map_err(DzipError::Io)?;
+                                raw_buf_reader
+                                    .seek(SeekFrom::Start(chunk.offset as u64))
+                                    .map_err(DzipError::Io)?;
                                 let mut raw_take = raw_buf_reader.take(chunk.real_c_len as u64);
-    
+
                                 observer.warn(&format!(
                                     "Failed to decompress chunk {}: {}. Writing raw data (keep-raw enabled).",
                                     chunk.id, err_msg
                                 ));
                                 std::io::copy(&mut raw_take, &mut writer).map_err(DzipError::Io)?;
                             } else {
-                                 return Err(e);
+                                return Err(e);
                             }
                         }
                     }
@@ -409,7 +426,7 @@ impl UnpackPlan {
                 Ok(())
             },
         )?;
-    
+
         observer.progress_finish("Done");
         Ok(())
     }
@@ -436,7 +453,7 @@ impl UnpackPlan {
             };
             let rel_path_display = full_raw_path.replace(['/', '\\'], MAIN_SEPARATOR_STR);
             let dir_display = raw_dir.replace(['/', '\\'], MAIN_SEPARATOR_STR);
-    
+
             toml_files.push(FileEntry {
                 path: rel_path_display,
                 directory: dir_display,
@@ -444,12 +461,12 @@ impl UnpackPlan {
                 chunks: entry.chunk_ids.clone(),
             });
         }
-    
+
         let mut toml_chunks = Vec::new();
         // Use processed_chunks for config, as they have the correct sizes
         let mut sorted_chunks = self.processed_chunks.clone();
         sorted_chunks.sort_by_key(|c| c.id);
-    
+
         for c in sorted_chunks {
             toml_chunks.push(ChunkDef {
                 id: c.id,
@@ -460,7 +477,7 @@ impl UnpackPlan {
                 archive_file_index: c.file_idx,
             });
         }
-    
+
         let config = Config {
             archive: ArchiveMeta {
                 version: self.metadata.version,
@@ -473,15 +490,18 @@ impl UnpackPlan {
             files: toml_files,
             chunks: toml_chunks,
         };
-    
+
         let config_path = PathBuf::from(format!("{}.toml", base_name));
-    
+
         let toml_str = toml::to_string_pretty(&config).map_err(DzipError::TomlSer)?;
-        
+
         let mut f = fs_impl.create_file(&config_path)?;
         f.write_all(toml_str.as_bytes()).map_err(DzipError::Io)?;
-    
-        observer.info(&format!("Unpack complete. Config saved to {:?}", config_path));
+
+        observer.info(&format!(
+            "Unpack complete. Config saved to {:?}",
+            config_path
+        ));
         Ok(())
     }
 }
