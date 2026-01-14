@@ -196,7 +196,6 @@ impl PackPlan {
         }
         for d in self.sorted_dirs.iter().skip(1) {
             header_buffer
-                // [Logic Change] Pass-through writing.
                 // We write the directory name exactly as it appears in the Config/String.
                 // This allows the CLI to control whether to use '/' or '\'.
                 .write_all(d.as_bytes())
@@ -211,7 +210,6 @@ impl PackPlan {
                 &raw_d
             };
 
-            // Replaced unwrap with safer access pattern (though logic guarantees existence)
             let d_id = *self.dir_map.get(d_key).unwrap_or(&0) as u16;
 
             header_buffer
