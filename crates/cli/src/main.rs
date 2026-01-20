@@ -8,6 +8,7 @@ use std::path::Path;
 
 use args::{Cli, Commands};
 use fs::{FsPackSink, FsPackSource, FsUnpackSink, FsUnpackSource};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use dzip_core::utils::to_native_path;
 use dzip_core::{Result, do_list, do_pack, do_unpack, model::Config};
@@ -24,6 +25,24 @@ fn main() {
     builder.init();
 
     let run = || -> Result<()> {
+        let pb = ProgressBar::new(0);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+
+        let on_progress = move |event: dzip_core::ProgressEvent| match event {
+            dzip_core::ProgressEvent::Start(total) => {
+                pb.set_length(total as u64);
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            }
+            dzip_core::ProgressEvent::Inc(n) => pb.inc(n as u64),
+            dzip_core::ProgressEvent::Finish => pb.finish_and_clear(),
+        };
+
         match &cli.command {
             Commands::Unpack {
                 input,
@@ -49,12 +68,16 @@ fn main() {
                 let out_dir = output
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from(base_stem.to_string()));
+                std_fs::create_dir_all(&out_dir).map_err(|e| {
+                    dzip_core::DzipError::IoContext(out_dir.display().to_string(), e)
+                })?;
+
                 let sink = FsUnpackSink {
                     output_dir: out_dir,
                 };
 
                 // Config now contains OS-native paths (e.g., backslashes on Windows)
-                let config = do_unpack(&source, &sink, *keep_raw)?;
+                let config = do_unpack(&source, &sink, *keep_raw, on_progress)?;
 
                 let toml_str =
                     toml::to_string_pretty(&config).map_err(dzip_core::DzipError::TomlSer)?;
@@ -92,7 +115,7 @@ fn main() {
                     output_dir: config_parent,
                     base_name: base_name.clone(),
                 };
-                do_pack(core_config, base_name, &mut sink, &source)
+                do_pack(core_config, base_name, &mut sink, &source, on_progress)
             }
             Commands::List { input } => {
                 let base_dir = input.parent().unwrap_or(Path::new(".")).to_path_buf();

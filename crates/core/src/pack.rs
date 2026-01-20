@@ -48,9 +48,10 @@ pub fn do_pack(
     base_dir_name: String,
     sink: &mut dyn PackSink,
     source: &dyn PackSource,
+    on_progress: impl Fn(crate::ProgressEvent) + Send + Sync,
 ) -> Result<()> {
     let plan = PackPlan::build(config, base_dir_name, source)?;
-    plan.execute(sink, source)?;
+    plan.execute(sink, source, on_progress)?;
     Ok(())
 }
 
@@ -138,7 +139,12 @@ impl PackPlan {
         })
     }
 
-    pub fn execute(&self, sink: &mut dyn PackSink, source: &dyn PackSource) -> Result<()> {
+    pub fn execute(
+        &self,
+        sink: &mut dyn PackSink,
+        source: &dyn PackSource,
+        on_progress: impl Fn(crate::ProgressEvent) + Send + Sync,
+    ) -> Result<()> {
         info!("Packing logical archive: {:?}", self.base_dir_name);
         let mut writers = self.prepare_writers(sink)?;
 
@@ -146,8 +152,13 @@ impl PackPlan {
 
         let current_offset_0 = writers.main.stream_position().map_err(DzipError::Io)? as u32;
 
-        let final_chunks =
-            self.run_compression_pipeline(current_offset_0, writers.main, writers.split, source)?;
+        let final_chunks = self.run_compression_pipeline(
+            current_offset_0,
+            writers.main,
+            writers.split,
+            source,
+            on_progress,
+        )?;
 
         let (updated_chunks, mut main_writer_final) = final_chunks;
 
@@ -290,10 +301,12 @@ impl PackPlan {
         mut writer0: BufWriter<BoxedWriter>,
         mut split_writers: HashMap<u16, BufWriter<BoxedWriter>>,
         source: &dyn PackSource,
+        on_progress: impl Fn(crate::ProgressEvent) + Send + Sync,
     ) -> Result<PipelineOutput> {
         let mut sorted_chunks_def = self.config.chunks.clone();
         sorted_chunks_def.sort_by_key(|c| c.id);
         info!("Compressing {} chunks ...", sorted_chunks_def.len());
+        on_progress(crate::ProgressEvent::Start(sorted_chunks_def.len()));
 
         let jobs: Result<Vec<CompressionJob>> = sorted_chunks_def
             .iter()
@@ -390,11 +403,13 @@ impl PackPlan {
                         *offset += c_def.size_compressed;
                     }
                     next_idx += 1;
+                    on_progress(crate::ProgressEvent::Inc(1));
                 }
 
                 for w in split_writers.values_mut() {
                     w.flush().map_err(DzipError::Io)?;
                 }
+                on_progress(crate::ProgressEvent::Finish);
                 Ok((sorted_chunks_def, writer0))
             });
 

@@ -48,10 +48,11 @@ pub fn do_unpack(
     source: &dyn UnpackSource,
     sink: &dyn UnpackSink,
     keep_raw: bool,
+    on_progress: impl Fn(crate::ProgressEvent) + Send + Sync,
 ) -> Result<Config> {
     let meta = ArchiveMetadata::load(source)?;
     let plan = UnpackPlan::build(meta, source)?;
-    plan.extract(sink, keep_raw, source)?;
+    plan.extract(sink, keep_raw, source, on_progress)?;
     let config = plan.generate_config_struct()?;
     info!("Unpack complete. Config object generated.");
     Ok(config)
@@ -270,8 +271,10 @@ impl UnpackPlan {
         sink: &dyn UnpackSink,
         keep_raw: bool,
         source: &dyn UnpackSource,
+        on_progress: impl Fn(crate::ProgressEvent) + Send + Sync,
     ) -> Result<()> {
         info!("Extracting {} files...", self.metadata.map_entries.len());
+        on_progress(crate::ProgressEvent::Start(self.metadata.map_entries.len()));
         let chunk_indices: HashMap<u16, usize> = self
             .processed_chunks
             .iter()
@@ -378,9 +381,11 @@ impl UnpackPlan {
                         }
                     }
                     writer.flush().map_err(DzipError::Io)?;
+                    on_progress(crate::ProgressEvent::Inc(1));
                     Ok(())
                 },
             )?;
+        on_progress(crate::ProgressEvent::Finish);
         Ok(())
     }
 

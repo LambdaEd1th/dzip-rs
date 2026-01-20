@@ -17,3 +17,10 @@ pub use pack::do_pack;
 pub use unpack::do_unpack;
 
 pub type Result<T> = std::result::Result<T, DzipError>;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressEvent {
+    Start(usize),
+    Inc(usize),
+    Finish,
+}
