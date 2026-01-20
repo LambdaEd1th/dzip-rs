@@ -13,7 +13,7 @@ dzip-core = { path = "../core" }
 # CLI specific dependencies (UI/Args/Logs)
 serde = { workspace = true }
 log = { workspace = true }
-toml = "0.9.8"
+toml = { workspace = true }
 clap = { version = "4.5.53", features = ["derive"] }
 env_logger = "0.11"
 indicatif = "0.18.3"
