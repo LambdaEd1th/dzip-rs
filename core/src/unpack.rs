@@ -288,28 +288,27 @@ impl UnpackPlan {
             .par_iter()
             .enumerate()
             .try_for_each_init(
-                HashMap::new,
-                |file_cache: &mut HashMap<u16, Box<dyn ReadSeekSend>>,
+                || (HashMap::new(), PathBuf::new()),
+                |(file_cache, path_buf): &mut (HashMap<u16, Box<dyn ReadSeekSend>>, PathBuf),
                  (file_id, entry)|
                  -> Result<()> {
-                    // Fixed: Use 'file_id' index
                     let fname = &self.metadata.user_files[file_id];
 
-                    // Fixed: Cast u16 dir_idx to usize
                     let raw_dir = if (entry.dir_idx as usize) < self.metadata.directories.len() {
                         &self.metadata.directories[entry.dir_idx as usize]
                     } else {
                         CURRENT_DIR_STR
                     };
 
-                    let mut path_buf = PathBuf::from(raw_dir);
+                    path_buf.clear();
                     if raw_dir != CURRENT_DIR_STR && !raw_dir.is_empty() {
+                        path_buf.push(raw_dir);
                         path_buf.push(fname);
                     } else {
-                        path_buf = PathBuf::from(fname);
+                        path_buf.push(fname);
                     }
 
-                    let rel_path = to_native_path(&path_buf);
+                    let rel_path = to_native_path(path_buf);
 
                     if let Some(parent) = path_buf
                         .parent()
