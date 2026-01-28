@@ -69,3 +69,13 @@ Desktop.ini
 # Vim / Emacs temporary files
 *.swp
 *.swo
+# ----------------------------------------------------------------------------
+# Project Specific
+# ----------------------------------------------------------------------------
+# Temporary directories created by CLI commands or tests
+temp_*/
+output/
+*_unpacked/
+
+# Generated config files during tests
+test*.toml
