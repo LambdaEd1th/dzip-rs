@@ -1,25 +1,10 @@
-# Cargo.toml (Root)
 [workspace]
-resolver = "2"
 members = ["core", "cli"]
+resolver = "2"
 
-[workspace.package]
-version = "0.2.2"
-edition = "2024"
-authors = ["Ed1th"]
-readme = "README.md"
-license = "GPL-3.0-or-later"
-
-[workspace.dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-toml = "0.9.8"
-log = "0.4.20"
-
-# --- Release Profile Settings ---
-# These settings apply to the entire workspace when running with --release
 [profile.release]
-strip = true      # Strip symbols from binary to reduce size
-opt-level = 3     # Optimize for speed
-lto = true        # Enable Link Time Optimization
-codegen-units = 1 # Reduce parallelism for better optimization
-panic = "abort"   # Abort on panic instead of unwinding (smaller binary)
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = 3

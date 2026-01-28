@@ -1,100 +1,80 @@
 # dzip-rs
 
-**dzip-rs** is a modern, high-performance toolkit written in Rust for handling **Marmalade SDK** resource archives (`.dz` and `.dzip`).
+A high-performance Rust implementation of the Dzip archive format tool.
+This project provides both a robust core library (`dzip-core`) and a feature-rich command-line interface (`dzip-cli`) for handling Dzip archives.
 
-This repository is organized as a **Rust Workspace** containing modular components for parsing, analyzing, extracting, and creating archive files. It aims to provide a safe and robust alternative to legacy tools, with a focus on correctness (fixing broken headers) and cross-platform compatibility.
+## Features
 
-## 📂 Project Structure
+- **High Performance**: Built with Rust and optimized for speed.
+- **Parallel Processing**: Utilizes multi-threading (`rayon`) for packing, unpacking, and verification, ensuring maximum throughput.
+- **Multi-Volume Support**: Seamlessly handles split archives (e.g., `archive.dz`, `archive01.dz`, ...).
+- **Compression Support**:
+    - **Cloud/Distributed**: Zlib, Bzip2, LZMA.
+    - **Specialized**: Zero (Run-length), Copy (Store), Combuf.
+- **Robust Verification**: Integrity checking for all chunks, including cross-validation of chunk headers and data.
+- **User Friendly**:
+    - Progress bars for long-running operations.
+    - Automatic config generation (`pack.toml`) during unpacking for easy repackaging.
 
-The project is divided into two main crates:
+## Installation
 
-| Crate | Path | Description |
-| --- | --- | --- |
-| **dzip-core** | [`crates/core`](https://github.com/LambdaEd1th/dzip-rs/tree/master/crates/core) | The backend library. It handles the binary format parsing, compression algorithms (LZMA, ZLIB, etc.), and parallel processing pipeline. It is I/O agnostic and can be embedded in other applications. |
-| **dzip-cli** | [`crates/cli`](https://github.com/LambdaEd1th/dzip-rs/tree/master/crates/cli) | The terminal frontend. A command-line tool that exposes the core functionality to end-users for unpacking, packing, and listing archive contents. |
-
-## ✨ Key Features
-
-* **⚡ Parallel Architecture**: Uses `rayon` to parallelize compression and decompression blocks, ensuring maximum throughput on multi-core systems.
-* **📊 Visual Progress**: Built-in progress bars with ETA and speed indicators for long-running operations.
-* **🔧 Legacy Support**: Automatically detects and fixes common errors in old archive headers (e.g., incorrect `ZSIZE` fields) by analyzing chunk offsets.
-* **📦 Split Archives**: Seamlessly handles multi-volume archives (e.g., `data.dz`, `data.d01`...) as a single logical unit.
-* **🐧 Cross-Platform**:
-* **Core**: Preserves raw path data for fidelity.
-* **CLI**: Automatically normalizes path separators (Windows backslashes `\` vs. Unix forward slashes `/`) depending on the user's operating system.
-* **📊 Visual Feedback**: Real-time progress bars for packing and unpacking operations, showing elapsed time, ETA, and processing speed.
-
-
-* **📄 Configurable**: Uses TOML configuration files to allow precise control over chunk layout and compression methods during packing.
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-* [Rust](https://www.rust-lang.org/tools/install) (latest stable version)
-* Git
-
-### Building the Workspace
-
-To build both the library and the CLI tool from the root directory:
+Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed.
 
 ```bash
 # Clone the repository
-git clone https://github.com/LambdaEd1th/dzip-rs.git
+git clone https://github.com/yourusername/dzip-rs.git
 cd dzip-rs
 
-# Build all crates in release mode
+# Build release version
 cargo build --release
-
 ```
 
-The compiled binary will be available at:
+The executable will be located at `target/release/dzip-cli`.
 
-* `target/release/dzip-cli` (Linux/macOS)
-* `target/release/dzip-cli.exe` (Windows)
+## Usage
 
-### Running Tests
-
-Run the test suite for the entire workspace to ensure integrity:
+### Unpack
+Extracts an archive to a specified directory.
 
 ```bash
-cargo test --workspace
-
+dzip-cli unpack <INPUT_FILE> [OUTPUT_DIR]
 ```
 
-## 📖 Usage Examples
+Example:
+```bash
+dzip-cli unpack game_data.dz ./extracted_data
+```
+*   Helper: Generates a `game_data.toml` in the output directory, which can be used to repack the files later.
 
-Since most users interact with the project via the CLI, here are quick examples. For detailed documentation, please refer to the [CLI README](https://github.com/LambdaEd1th/dzip-rs/tree/master/crates/cli/README.md).
+### Verify
+Verifies the integrity of an archive.
 
 ```bash
-# Unpack an archive
-./target/release/dzip-cli unpack assets.dz
-
-# List contents without extracting
-./target/release/dzip-cli list assets.dz
-
-# Repack from a config file
-./target/release/dzip-cli pack assets.toml
-
+dzip-cli verify <INPUT_FILE>
 ```
 
-## 🤝 Contributing
+Example:
+```bash
+dzip-cli verify game_data.dz
+```
+*   Displays a detailed table of all chunks, including their status (OK/FAIL), size, compression method, and path.
+*   checks all split volumes if present.
 
-Contributions are welcome! Please follow these steps:
+### Pack
+Creates a Dzip archive from a configuration file.
 
-1. **Fork** the repository.
-2. **Create** a feature branch (`git checkout -b feature/amazing-feature`).
-3. **Commit** your changes.
-4. **Push** to the branch.
-5. **Open** a Pull Request.
+```bash
+dzip-cli pack <CONFIG_FILE> [-o OUTPUT_DIR]
+```
 
-Please ensure your code passes `cargo clippy` and `cargo fmt` before submitting.
+Example:
+```bash
+dzip-cli pack extracted_data/game_data.toml -o ./new_build
+```
+*   Reads the TOML config (generated by `unpack` or created manually).
+*   Compresses files in parallel.
+*   Writes the .dz file (and volumes if configured) to the output directory.
 
-## 📄 License
+## License
 
-This project is licensed under the **GNU General Public License v3.0**.
-See the [LICENSE](https://github.com/LambdaEd1th/dzip-rs/blob/master/LICENSE) file for details.
-
----
-
-*Marmalade SDK is a trademark of its respective owners.*
+This project is licensed under the GNU General Public License v3.0 (GPLv3). See the [LICENSE](LICENSE) file for details.
