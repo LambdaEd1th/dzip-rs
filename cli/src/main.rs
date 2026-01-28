@@ -429,12 +429,11 @@ fn pack_archive(input_path: &str, output_dir: &str) -> Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // If base_dir is "." (default), make it relative to the config file's directory
-    if config.base_dir == std::path::Path::new(".") {
-        if let Some(parent) = config_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                config.base_dir = parent.to_path_buf();
-            }
-        }
+    if config.base_dir == std::path::Path::new(".")
+        && let Some(parent) = config_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        config.base_dir = parent.to_path_buf();
     }
 
     std::fs::create_dir_all(output_dir)?;
